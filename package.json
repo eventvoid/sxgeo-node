@@ -1,0 +1,42 @@
+{
+  "name": "sxgeo-node",
+  "version": "0.1.0",
+  "description": "Node.js reader for Sypex Geo binary databases.",
+  "type": "commonjs",
+  "main": "dist/sxgeo.js",
+  "exports": {
+    ".": "./dist/sxgeo.js"
+  },
+  "types": "dist/sxgeo.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node test/test.js",
+    "prepack": "npm run build"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eventvoid/sxgeo-node.git"
+  },
+  "keywords": [
+    "sxgeo",
+    "sypexgeo",
+    "geoip",
+    "ip",
+    "ip-geolocation",
+    "nodejs"
+  ],
+  "author": "eventvoid",
+  "bugs": {
+    "url": "https://github.com/eventvoid/sxgeo-node/issues"
+  },
+  "homepage": "https://github.com/eventvoid/sxgeo-node#readme",
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.3"
+  }
+}
