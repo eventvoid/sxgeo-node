@@ -1,21 +1,35 @@
 {
   "name": "sxgeo-node",
-  "version": "0.1.0",
-  "description": "Node.js reader for Sypex Geo binary databases.",
+  "version": "0.2.0",
+  "description": "Fast, dependency-free Node.js reader for Sypex Geo databases.",
   "type": "commonjs",
   "main": "dist/sxgeo.js",
-  "exports": {
-    ".": "./dist/sxgeo.js"
-  },
   "types": "dist/sxgeo.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/sxgeo.d.ts",
+      "require": "./dist/sxgeo.js",
+      "default": "./dist/sxgeo.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "build": "tsc",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc",
+    "bench": "npm run build && node bench/bench.js",
     "test": "npm run build && node test/test.js",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "prepublishOnly": "npm test"
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "repository": {
     "type": "git",
@@ -29,14 +43,14 @@
     "ip-geolocation",
     "nodejs"
   ],
-  "author": "eventvoid",
+  "author": "Yeskendir Temiralinov",
+  "license": "BSD-3-Clause",
   "bugs": {
     "url": "https://github.com/eventvoid/sxgeo-node/issues"
   },
   "homepage": "https://github.com/eventvoid/sxgeo-node#readme",
   "devDependencies": {
     "@types/node": "^20.14.10",
-    "ts-node": "^10.9.2",
     "typescript": "^5.5.3"
   }
 }

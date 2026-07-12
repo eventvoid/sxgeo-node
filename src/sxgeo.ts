@@ -1,29 +1,30 @@
 import * as fs from 'node:fs';
 
-function ip2long(ip: string): number | false {
-    const ipArray = ip.split('.');
+function parseIpv4(ip: string): number | false {
+    if (ip.length < 7 || ip.length > 15) return false;
 
-    if (ipArray.length !== 4) {
-        return false;
-    }
+    let result = 0;
+    let octet = 0;
+    let value = 0;
+    let digits = 0;
 
-    for (const octet of ipArray) {
-        const numericOctet = parseInt(octet, 10);
-        if (isNaN(numericOctet) || numericOctet < 0 || numericOctet > 255) {
-            return false;
+    for (let index = 0; index <= ip.length; index++) {
+        const code = index === ip.length ? 46 : ip.charCodeAt(index);
+        if (code === 46) {
+            if (digits === 0 || value > 255 || octet > 3) return false;
+            result = (result * 256 + value) >>> 0;
+            octet++;
+            value = 0;
+            digits = 0;
+            continue;
         }
+        if (code < 48 || code > 57 || digits === 3) return false;
+        if (digits === 0 && code === 48 && index + 1 < ip.length && ip.charCodeAt(index + 1) !== 46) return false;
+        value = value * 10 + code - 48;
+        digits++;
     }
 
-    const long = (parseInt(ipArray[0], 10) << 24) |
-        (parseInt(ipArray[1], 10) << 16) |
-        (parseInt(ipArray[2], 10) << 8) |
-        parseInt(ipArray[3], 10);
-    
-    if (long > 0x7FFFFFFF) {
-        return long - 0xFFFFFFFF - 1;
-    }
-
-    return long;
+    return octet === 4 ? result >>> 0 : false;
 }
 
 function unpackString(buffer: Buffer): number[] {
@@ -37,19 +38,8 @@ function unpackString(buffer: Buffer): number[] {
     return result;
 }
 
-function strSplit(inputString: Buffer, length: number): Buffer[] {
-    const result: Buffer[] = [];
-    const uint8Array = new Uint8Array(inputString);
-
-    for (let i = 0; i < uint8Array.length; i += length) {
-        result.push(Buffer.from(uint8Array.slice(i, i + length)));
-    }
-
-    return result;
-}
-
 function readChunk(fd: number, length: number, position: number): Buffer {
-    const buffer = Buffer.alloc(length);
+    const buffer = Buffer.allocUnsafe(length);
     const bytesRead = fs.readSync(fd, buffer, 0, length, position);
 
     return bytesRead === length ? buffer : buffer.subarray(0, bytesRead);
@@ -60,6 +50,7 @@ const SXGEO_MEMORY = 1;
 const SXGEO_BATCH = 2;
 
 interface AboutInfo {
+    version: number;
     created: string;
     timestamp: number;
     charset: string;
@@ -104,7 +95,35 @@ interface Info {
     cities_begin?: number;
 };
 
+interface FieldSpec {
+    type: string;
+    name: string;
+    width: number;
+    scale: number;
+}
+
+function compileFormat(format: string): FieldSpec[] {
+    return format.split('/').map((part) => {
+        const separator = part.indexOf(':');
+        const type = separator === -1 ? part : part.slice(0, separator);
+        const name = separator === -1 ? '' : part.slice(separator + 1);
+        const kind = type.charAt(0);
+        let width = 4;
+
+        if (kind === 't' || kind === 'T') width = 1;
+        else if (kind === 's' || kind === 'S' || kind === 'n') width = 2;
+        else if (kind === 'm' || kind === 'M') width = 3;
+        else if (kind === 'd') width = 8;
+        else if (kind === 'c') width = Number.parseInt(type.slice(1), 10);
+        else if (kind === 'b') width = -1;
+
+        const precision = kind === 'n' || kind === 'N' ? Number.parseInt(type.slice(1), 10) : 0;
+        return { type: kind, name, width, scale: 10 ** (Number.isNaN(precision) ? 0 : precision) };
+    }).filter((field) => field.name.length > 0);
+}
+
 class SxGeo {
+    private static readonly sharedImages = new Map<string, WeakRef<Buffer>>();
     static readonly FILE = SXGEO_FILE;
     static readonly MEMORY = SXGEO_MEMORY;
     static readonly BATCH = SXGEO_BATCH;
@@ -113,33 +132,43 @@ class SxGeo {
         MEMORY: SXGEO_MEMORY,
         BATCH: SXGEO_BATCH
     } as const;
+    /** Open a memory-mode reader that can share one read-only file image with other instances. */
+    static openShared(dbFile = 'SxGeo.dat', type = SXGEO_MEMORY | SXGEO_BATCH): SxGeo {
+        return new SxGeo(dbFile, type | SXGEO_MEMORY, true);
+    }
 
-    fh: number;
-    range: number;
-    b_idx_len: number;
-    m_idx_len: number;
-    db_items: number;
-    id_len: number;
-    block_len: number;
-    max_region: number;
-    max_city: number;
-    max_country: number;
-    country_size: number;
-    batch_mode: boolean = false;
-    memory_mode: boolean = false;
-    pack: string[] = [];
-    b_idx_str: Buffer = Buffer.alloc(0);
-    m_idx_str: Buffer = Buffer.alloc(0);
-    info!: Info;
-    db_begin: number;
-    b_idx_arr: number[] = [];
-    m_idx_arr: Buffer[] = [];
-    db: Buffer = Buffer.alloc(0);
-    regions_db: Buffer = Buffer.alloc(0);
-    cities_db: Buffer = Buffer.alloc(0);
-    ip1c: string = '';
+    private fh: number;
+    private range: number;
+    private b_idx_len: number;
+    private m_idx_len: number;
+    private db_items: number;
+    private id_len: number;
+    private block_len: number;
+    private max_region: number;
+    private max_city: number;
+    private max_country: number;
+    private country_size: number;
+    /** Whether the BATCH index mode is enabled (official API compatibility). */
+    batch_mode = false;
+    /** Whether the database image is loaded into memory (official API compatibility). */
+    memory_mode = false;
+    private pack: string[] = [];
+    private b_idx_str: Buffer = Buffer.alloc(0);
+    private m_idx_str: Buffer = Buffer.alloc(0);
+    private info!: Info;
+    private db_begin: number;
+    private b_idx_arr: number[] = [];
+    private m_idx_arr: number[] = [];
+    private db: Buffer = Buffer.alloc(0);
+    private regions_db: Buffer = Buffer.alloc(0);
+    private cities_db: Buffer = Buffer.alloc(0);
+    private closed = false;
+    private readonly decoder: TextDecoder;
+    private readonly countryCache = new Map<number, { id: number; iso: string }>();
+    private readonly cityCache = new Map<number, { short?: SxGeo.CityResult; full?: SxGeo.CityFullResult }>();
+    private readonly formats = new Map<string, readonly FieldSpec[]>();
 
-    ip2iso: string[] = ['', 'AP', 'EU', 'AD', 'AE', 'AF', 'AG', 'AI', 'AL', 'AM', 'CW', 'AO', 'AQ', 'AR', 'AS', 'AT', 'AU',
+    readonly id2iso: readonly string[] = ['', 'AP', 'EU', 'AD', 'AE', 'AF', 'AG', 'AI', 'AL', 'AM', 'CW', 'AO', 'AQ', 'AR', 'AS', 'AT', 'AU',
         'AW', 'AZ', 'BA', 'BB', 'BD', 'BE', 'BF', 'BG', 'BH', 'BI', 'BJ', 'BM', 'BN', 'BO', 'BR', 'BS',
         'BT', 'BV', 'BW', 'BY', 'BZ', 'CA', 'CC', 'CD', 'CF', 'CG', 'CH', 'CI', 'CK', 'CL', 'CM', 'CN',
         'CO', 'CR', 'CU', 'CV', 'CX', 'CY', 'CZ', 'DE', 'DJ', 'DK', 'DM', 'DO', 'DZ', 'EC', 'EE', 'EG',
@@ -156,17 +185,33 @@ class SxGeo {
         'US', 'UY', 'UZ', 'VA', 'VC', 'VE', 'VG', 'VI', 'VN', 'VU', 'WF', 'WS', 'YE', 'YT', 'RS', 'ZA',
         'ZM', 'ME', 'ZW', 'A1', 'XK', 'O1', 'AX', 'GG', 'IM', 'JE', 'BL', 'MF', 'BQ', 'SS'
     ];
-    constructor(dbFile = 'SxGeo.dat', type = SXGEO_FILE) {
+    /** @deprecated Use the official `id2iso` name. Kept for sxgeo-node 0.1 compatibility. */
+    readonly ip2iso = this.id2iso;
+    constructor(dbFile = 'SxGeo.dat', type = SXGEO_FILE, shared = false) {
         if (!fs.existsSync(dbFile)) {
             throw new Error("Can't open file");
         }
 
-        this.fh = fs.openSync(dbFile, 'r');
+        let memoryImage: Buffer | undefined;
+        if ((type & SXGEO_MEMORY) !== 0) {
+            if (shared) {
+                const resolved = fs.realpathSync(dbFile);
+                const stat = fs.statSync(resolved);
+                const cacheKey = `${resolved}\0${stat.size}\0${stat.mtimeMs}`;
+                memoryImage = SxGeo.sharedImages.get(cacheKey)?.deref();
+                if (!memoryImage) {
+                    memoryImage = fs.readFileSync(resolved);
+                    SxGeo.sharedImages.set(cacheKey, new WeakRef(memoryImage));
+                }
+            } else {
+                memoryImage = fs.readFileSync(dbFile);
+            }
+        }
+        this.fh = memoryImage ? -1 : fs.openSync(dbFile, 'r');
 
-        const header = Buffer.alloc(40);
-        fs.readSync(this.fh, header, 0, 40, 0);
-        if (header.toString('utf8', 0, 3) !== 'SxG') {
-            fs.closeSync(this.fh);
+        const header = memoryImage ? memoryImage.subarray(0, 40) : readChunk(this.fh, 40, 0);
+        if (header.length !== 40 || header.toString('utf8', 0, 3) !== 'SxG') {
+            if (this.fh >= 0) fs.closeSync(this.fh);
             throw new Error(`Can't open ${dbFile}`);
         }
         
@@ -192,7 +237,20 @@ class SxGeo {
         };
 
         if (info['b_idx_len'] * info['m_idx_len'] * info['range'] * info['db_items'] * info['time'] * info['id_len'] == 0) {
+            if (this.fh >= 0) fs.closeSync(this.fh);
             throw new Error(`Wrong file format ${dbFile}`);
+        }
+        if (info.ver < 21 || info.charset > 2 || info.id_len > 4) {
+            if (this.fh >= 0) fs.closeSync(this.fh);
+            throw new Error(`Unsupported Sypex Geo format ${dbFile}`);
+        }
+
+        const minimumSize = 40 + info.pack_size + info.b_idx_len * 4 + info.m_idx_len * 4 +
+            info.db_items * (3 + info.id_len) + info.region_size + info.city_size;
+        const fileSize = memoryImage?.length ?? fs.fstatSync(this.fh).size;
+        if (fileSize < minimumSize) {
+            if (this.fh >= 0) fs.closeSync(this.fh);
+            throw new Error(`Truncated Sypex Geo database ${dbFile}`);
         }
 
         this.range = info.range;
@@ -207,55 +265,48 @@ class SxGeo {
         this.country_size = info.country_size;
         this.batch_mode = (type & SxGeo.BATCH) !== 0;
         this.memory_mode = (type & SxGeo.MEMORY) !== 0;
+        const encodings = ['utf-8', 'iso-8859-1', 'windows-1251'];
+        this.decoder = new TextDecoder(encodings[info.charset] ?? 'utf-8');
 
         if (info.pack_size) {
-            const buffer = readChunk(this.fh, info.pack_size, 40);
+            const buffer = memoryImage
+                ? memoryImage.subarray(40, 40 + info.pack_size)
+                : readChunk(this.fh, info.pack_size, 40);
             this.pack = buffer.toString('binary').split('\0');
+            for (const format of this.pack) {
+                if (format) this.formats.set(format, compileFormat(format));
+            }
         }
 
         const bIdxBufferSize = info['b_idx_len'] * 4;
-        const bIdxBuffer = Buffer.alloc(bIdxBufferSize);
-
-        fs.readSync(this.fh, bIdxBuffer, 0, bIdxBufferSize, 40 + info.pack_size);
+        const bIdxStart = 40 + info.pack_size;
+        const bIdxBuffer = memoryImage
+            ? memoryImage.subarray(bIdxStart, bIdxStart + bIdxBufferSize)
+            : readChunk(this.fh, bIdxBufferSize, bIdxStart);
         this.b_idx_str = bIdxBuffer;
 
         const mIdxBufferSize = info['m_idx_len'] * 4;
-        const mIdxBuffer = Buffer.alloc(mIdxBufferSize);
-
-        fs.readSync(this.fh, mIdxBuffer, 0, mIdxBufferSize, 40 + info.pack_size + bIdxBufferSize);
+        const mIdxStart = bIdxStart + bIdxBufferSize;
+        const mIdxBuffer = memoryImage
+            ? memoryImage.subarray(mIdxStart, mIdxStart + mIdxBufferSize)
+            : readChunk(this.fh, mIdxBufferSize, mIdxStart);
         this.m_idx_str = mIdxBuffer;
 
         this.db_begin = mIdxBufferSize + 40 + info.pack_size + bIdxBufferSize;
         
         if (this.batch_mode) {
             this.b_idx_arr = Array.from(unpackString(this.b_idx_str));
-            this.m_idx_arr = strSplit(this.m_idx_str, 4);
+            this.m_idx_arr = unpackString(this.m_idx_str);
         }
 
         if (this.memory_mode) {
-            const bIdxBufferSize = this.db_items * this.block_len;
-            const bIdxBuffer = Buffer.alloc(bIdxBufferSize);
-            
-            fs.readSync(this.fh, bIdxBuffer, 0, bIdxBufferSize, this.db_begin);
-            this.db = bIdxBuffer;
-
-            if (info.region_size > 0) {
-                const regionBuffer = Buffer.alloc(info.region_size);
-                fs.readSync(this.fh, regionBuffer, 0, info.region_size, this.db_begin + bIdxBufferSize);
-                this.regions_db = regionBuffer;
-            } else {
-                this.regions_db = Buffer.alloc(0);
-            }
-
-            if (info.city_size > 0) {
-                const citiesdbBufferSize = info.city_size;
-                const citiesdbBuffer = Buffer.alloc(citiesdbBufferSize);
-
-                fs.readSync(this.fh, citiesdbBuffer, 0, citiesdbBufferSize, this.db_begin + bIdxBufferSize + info.region_size);
-                this.cities_db = citiesdbBuffer;
-            } else {
-                this.cities_db = Buffer.alloc(0);
-            }
+            const image = memoryImage!;
+            const dbSize = this.db_items * this.block_len;
+            const regionsBegin = this.db_begin + dbSize;
+            const citiesBegin = regionsBegin + info.region_size;
+            this.db = image.subarray(this.db_begin, regionsBegin);
+            this.regions_db = image.subarray(regionsBegin, citiesBegin);
+            this.cities_db = image.subarray(citiesBegin, citiesBegin + info.city_size);
         }
 
         this.info = info;
@@ -263,18 +314,18 @@ class SxGeo {
         this.info.cities_begin = this.info.regions_begin + info.region_size;
     }
 
-    protected searchIdx(ipn: Buffer, min: number, max: number): number {
+    private searchIdx(ipNumber: number, min: number, max: number): number {
         if (this.batch_mode) {
             while (max - min > 8) {
                 const offset = (min + max) >> 1;
-                if (Buffer.compare(ipn, this.m_idx_arr[offset]) > 0) {
+                if (ipNumber > this.m_idx_arr[offset]) {
                     min = offset;
                 } else {
                     max = offset;
                 }
             }
 
-            while (Buffer.compare(ipn, this.m_idx_arr[min]) > 0) {
+            while (ipNumber > this.m_idx_arr[min]) {
                 min++;
                 if (min > max) {
                     break;
@@ -283,14 +334,14 @@ class SxGeo {
         } else {
             while (max - min > 8) {
                 const offset = (min + max) >> 1;
-                if (Buffer.compare(ipn, this.m_idx_str.subarray(offset * 4, offset * 4 + 4)) > 0) {
+                if (ipNumber > this.m_idx_str.readUInt32BE(offset * 4)) {
                     min = offset;
                 } else {
                     max = offset;
                 }
             }
 
-            while (Buffer.compare(ipn, this.m_idx_str.subarray(min * 4, min * 4 + 4)) > 0) {
+            while (ipNumber > this.m_idx_str.readUInt32BE(min * 4)) {
                 min++;
                 if (min > max) {
                     break;
@@ -300,17 +351,19 @@ class SxGeo {
         return min;
     }
 
-    searchDb(str_: Buffer, ipn: Buffer, min_: number, max_: number): number {
+    private searchDb(str_: Buffer, ipNumber: number, min_: number, max_: number): number {
         const lenBlock = this.block_len;
+        const ipTail = ipNumber & 0x00ffffff;
+        const firstOffset = min_ * lenBlock;
+
+        if (firstOffset + 3 > str_.length || ipTail < str_.readUIntBE(firstOffset, 3)) return 0;
 
         if ((max_ - min_) > 1) {
-            ipn = Buffer.from(new Uint8Array(ipn).slice(1));
-
             while ((max_ - min_) > 8) {
                 const offset = (min_ + max_) >> 1;
                 const start = offset * lenBlock;
 
-                if (Buffer.compare(ipn, Buffer.from(new Uint8Array(str_).slice(start, start + 3))) > 0) {
+                if (ipTail > str_.readUIntBE(start, 3)) {
                     min_ = offset;
                 } else {
                     max_ = offset;
@@ -319,7 +372,7 @@ class SxGeo {
 
             let start = min_ * lenBlock;
 
-            while (Buffer.compare(ipn, Buffer.from(new Uint8Array(str_).slice(start, start + 3))) >= 0) {
+            while (ipTail >= str_.readUIntBE(start, 3)) {
                 min_ += 1;
                 start = min_ * lenBlock;
 
@@ -334,29 +387,24 @@ class SxGeo {
         const lenId = this.id_len;
         const start = min_ * lenBlock - lenId;
 
-        return parseInt(Buffer.from(new Uint8Array(str_).slice(start, start + lenId)).toString('hex'), 16);
+        if (start < 0 || start + lenId > str_.length) return 0;
+        return str_.readUIntBE(start, lenId);
     }
 
-    public getNum(ip: string): any {
-        const ip1n: number = parseInt(ip, 10);
-        let ipn: any = ip2long(ip);
-        if (ip1n === 0 || ip1n === 10 || ip1n === 127 || ip1n >= this.b_idx_len || isNaN(ip1n) || ipn === false) {
+    private getNum(ip: string): number | false {
+        this.assertOpen();
+        const ipNumber = parseIpv4(ip);
+        if (ipNumber === false) return false;
+        const ip1n = ipNumber >>> 24;
+        if (ip1n === 0 || ip1n === 10 || ip1n === 127 || ip1n >= this.b_idx_len) {
             return false;
         }
-
-        const buffer = new ArrayBuffer(4);
-        const view = new DataView(buffer);
-        view.setUint32(0, ipn, false);
-        const byteArray = new Uint8Array(buffer);
-        ipn = Buffer.from(byteArray);
-
-        this.ip1c = String.fromCharCode(ip1n);
 
         let blocks: { min: number; max: number };
         if (this.batch_mode) {
             blocks = { min: this.b_idx_arr[ip1n - 1], max: this.b_idx_arr[ip1n] };
         } else {
-            const header = Buffer.from(new Uint8Array(this.b_idx_str).slice((ip1n - 1) * 4, (ip1n - 1) * 4 + 8));
+            const header = this.b_idx_str.subarray((ip1n - 1) * 4, (ip1n - 1) * 4 + 8);
             blocks = {
                 min: header.readUInt32BE(0),
                 max: header.readUInt32BE(4)
@@ -365,7 +413,7 @@ class SxGeo {
 
         let min: number, max: number;
         if (blocks.max - blocks.min > this.range) {
-            const part: number = this.searchIdx(ipn, Math.floor(blocks.min / this.range), Math.floor(blocks.max / this.range) - 1);
+            const part = this.searchIdx(ipNumber, Math.floor(blocks.min / this.range), Math.floor(blocks.max / this.range) - 1);
 
             min = part > 0 ? part * this.range : 0;
             max = part > this.m_idx_len ? this.db_items : (part + 1) * this.range;
@@ -380,14 +428,14 @@ class SxGeo {
         const len: number = max - min;
 
         if (this.memory_mode) {
-            return this.searchDb(this.db, ipn, min, max);
+            return this.searchDb(this.db, ipNumber, min, max);
         }
 
         const dbChunk = readChunk(this.fh, len * this.block_len, this.db_begin + min * this.block_len);
-        return this.searchDb(dbChunk, ipn, 0, len);
+        return this.searchDb(dbChunk, ipNumber, 0, len);
     }
 
-    readData(seek: number, max: number, type: number) {
+    private readData(seek: number, max: number, type: number): SxGeo.RecordData {
         let raw: Buffer = Buffer.alloc(0);
 
         if (seek && max) {
@@ -400,7 +448,7 @@ class SxGeo {
                     src = this.cities_db;
                 }
 
-                raw = Buffer.from(new Uint8Array(src).slice(seek, seek + max));
+                raw = src.subarray(seek, seek + max);
             } else {
                 let boundaryKey: keyof Info = 'cities_begin';
 
@@ -417,9 +465,9 @@ class SxGeo {
         return unpackedData;
     }
 
-    parseCity(seek: number, full: boolean = false) {
+    private parseCity(seek: number, full: boolean = false): SxGeo.CityResult | SxGeo.CityFullResult {
         if (!this.pack.length) {
-            return {};
+            throw new Error('This database does not contain city records');
         }
 
         let countryOnly = false;
@@ -433,11 +481,7 @@ class SxGeo {
             city.lon = country.lon;
         } else {
             city = this.readData(seek, this.max_city, 2);
-            country = {
-                id: city.country_id,
-                iso: this.ip2iso[city.country_id]
-            };
-            delete city.country_id;
+            country = { id: city.country_id, iso: this.id2iso[Number(city.country_id)] };
         }
 
         let region: any = null;
@@ -449,155 +493,228 @@ class SxGeo {
                 country = this.readData(region.country_seek, this.max_country, 0);
             }
 
+            delete city.country_id;
             delete city.region_seek;
             delete region.country_seek;
-
             return { city, region, country };
         }
 
+        delete city.country_id;
         delete city.region_seek;
         return { city, country: { id: country.id, iso: country.iso } };
     }
     
-    unpack(pack: string | undefined, item: Buffer): { [key: string]: any } {
-        const unpacked: { [key: string]: any } = {};
+    private unpack(pack: string | undefined, item: Buffer): SxGeo.RecordData {
+        const unpacked: SxGeo.RecordData = {};
         if (!pack) {
             return unpacked;
         }
 
         const empty = item.length === 0;
-        const packArray = pack.split('/');
+        const fields = this.formats.get(pack) ?? compileFormat(pack);
         let pos = 0;
 
-        packArray.forEach((p) => {
-            const [type, name] = p.split(':');
-            const type0 = type.charAt(0);
-
+        for (const field of fields) {
+            const { type, name } = field;
             if (empty) {
-                unpacked[name] = type0 === 'b' || type0 === 'c' ? '' : 0;
-                return;
+                unpacked[name] = type === 'b' || type === 'c' ? '' : 0;
+                continue;
             }
 
-            let l: number;
-            switch (type0) {
+            let width = field.width;
+            let value: number | string;
+            switch (type) {
                 case 't':
-                case 'T':
-                    l = 1;
-                    break;
-                case 's':
-                case 'n':
-                case 'S':
-                    l = 2;
-                    break;
-                case 'm':
-                case 'M':
-                    l = 3;
-                    break;
-                case 'd':
-                    l = 8;
-                    break;
-                case 'c':
-                    l = parseInt(type.slice(1).toString(), 10);
-                    break;
-                case 'b':
-                    {
-                        const end = item.indexOf(0, pos);
-                        l = end === -1 ? item.length - pos : end - pos;
-                    }
-                    break;
-                default:
-                    l = 4;
-            }
-
-            const val: Buffer = Buffer.from(new Uint8Array(item).slice(pos, pos + l));
-
-            let v: any;
-            switch (type0) {
-                case 't':
-                    v = val.readInt8(0);
+                    value = item.readInt8(pos);
                     break;
                 case 'T':
-                    v = val.readUInt8(0);
+                    value = item.readUInt8(pos);
                     break;
                 case 's':
-                    v = val.readInt16LE(0);
+                    value = item.readInt16LE(pos);
                     break;
                 case 'S':
-                    v = val.readUInt16LE(0);
+                    value = item.readUInt16LE(pos);
                     break;
                 case 'm':
-                    v = val.readIntLE(0, 3);
+                    value = item.readIntLE(pos, 3);
                     break;
                 case 'M':
-                    v = val.readUIntLE(0, 3);
+                    value = item.readUIntLE(pos, 3);
                     break;
                 case 'i':
-                    v = val.readInt32LE(0);
+                    value = item.readInt32LE(pos);
                     break;
                 case 'I':
-                    v = val.readUInt32LE(0);
+                    value = item.readUInt32LE(pos);
                     break;
                 case 'f':
-                    v = val.readFloatLE(0);
+                    value = item.readFloatLE(pos);
                     break;
                 case 'd':
-                    v = val.readDoubleLE(0);
+                    value = item.readDoubleLE(pos);
                     break;
                 case 'n':
-                    v = val.readInt16LE(0) / Math.pow(10, parseInt(type.charAt(1), 10));
+                    value = item.readInt16LE(pos) / field.scale;
                     break;
                 case 'N':
-                    v = val.readInt32LE(0) / Math.pow(10, parseInt(type.charAt(1), 10));
+                    value = item.readInt32LE(pos) / field.scale;
                     break;
-                case 'c':
-                    v = val.toString('utf8').replace(/ +$/, '');
+                case 'c': {
+                    value = this.decoder.decode(item.subarray(pos, pos + width)).replace(/ +$/, '');
                     break;
-                case 'b':
-                    v = val.toString('utf8');
-                    l++;
+                }
+                case 'b': {
+                    const end = item.indexOf(0, pos);
+                    const stringEnd = end === -1 ? item.length : end;
+                    value = this.decoder.decode(item.subarray(pos, stringEnd));
+                    width = stringEnd - pos + (end === -1 ? 0 : 1);
                     break;
-                default:
-                    v = parseInt(val.toString('utf8'), 10);
+                }
+                default: {
+                    value = Number.parseInt(item.toString('utf8', pos, pos + width), 10);
                     break;
+                }
             }
-            
-            pos += l;
-            unpacked[name] = v;
-        });
+
+            pos += width;
+            unpacked[name] = value;
+        }
 
         return unpacked;
     }
 
-    get(ip: string) {
+    get(ip: string): SxGeo.CityResult | string | false {
         return this.max_city ? this.getCity(ip) : this.getCountry(ip);
     }
 
-    getCountry(ip: string) {
+    getCountry(ip: string): string | false {
         const num = this.getNum(ip);
+        if (num === false) return false;
         if (this.max_city) {
-            const tmp = this.parseCity(num);
-            return tmp.country.iso;
+            return this.getCountryIdentity(num).iso;
         }
-        return this.ip2iso[num];
+        return this.id2iso[num];
     }
 
-    getCountryId(ip: string) {
+    getCountryId(ip: string): number | false {
         const num = this.getNum(ip);
+        if (num === false) return false;
         if (this.max_city) {
-            const tmp = this.parseCity(num);
-            return tmp.country.id;
+            return this.getCountryIdentity(num).id;
         }
         return num;
     }
 
-    getCity(ip: string) {
+    getCity(ip: string): SxGeo.CityResult | false {
+        if (!this.max_city || !this.pack.length) return false;
         const seek = this.getNum(ip);
-        return seek ? this.parseCity(seek, false) : false;
+        if (!seek) return false;
+        const entry = this.cityCache.get(seek);
+        if (entry?.short) return this.cloneCityResult(entry.short);
+
+        const result = this.parseCity(seek, false) as SxGeo.CityResult;
+        this.cacheCityResult(seek, { ...entry, short: result });
+        return this.cloneCityResult(result);
     }
 
-    getCityFull(ip: string) {
+    getCityFull(ip: string): SxGeo.CityFullResult | false {
+        if (!this.max_city || !this.pack.length) return false;
         const seek = this.getNum(ip);
-        return seek ? this.parseCity(seek, true) : false;
+        if (!seek) return false;
+        const entry = this.cityCache.get(seek);
+        if (entry?.full) return this.cloneCityFullResult(entry.full);
+
+        const result = this.parseCity(seek, true) as SxGeo.CityFullResult;
+        this.cacheCityResult(seek, { ...entry, full: result });
+        return this.cloneCityFullResult(result);
+    }
+
+    /** Resolve several addresses while preserving input order. */
+    getMany(ips: readonly string[]): Array<SxGeo.CityResult | string | false> {
+        return ips.map((ip) => this.get(ip));
+    }
+
+    getCountryMany(ips: readonly string[]): Array<string | false> {
+        return ips.map((ip) => this.getCountry(ip));
+    }
+
+    getCityMany(ips: readonly string[], full = false): Array<SxGeo.CityResult | SxGeo.CityFullResult | false> {
+        return full ? ips.map((ip) => this.getCityFull(ip)) : ips.map((ip) => this.getCity(ip));
+    }
+
+    getDbVersion(): number {
+        return this.info.ver;
+    }
+
+    getDbDate(): Date {
+        return new Date(this.info.time * 1000);
+    }
+
+    /** Close the database file. Calling close more than once is safe. */
+    close(): void {
+        if (!this.closed) {
+            if (this.fh >= 0) fs.closeSync(this.fh);
+            this.closed = true;
+        }
+    }
+
+    /** Clear bounded lookup caches without closing the database. */
+    clearCache(): void {
+        this.countryCache.clear();
+        this.cityCache.clear();
+    }
+
+    /** Explicit resource management support (`using geo = new SxGeo(...)`). */
+    [Symbol.dispose](): void {
+        this.close();
+    }
+
+    private assertOpen(): void {
+        if (this.closed) {
+            throw new Error('SxGeo database is closed');
+        }
+    }
+
+    private getCountryIdentity(seek: number): { id: number; iso: string } {
+        const cached = this.countryCache.get(seek);
+        if (cached) return cached;
+
+        const result = this.parseCity(seek, false) as SxGeo.CityResult;
+        const identity = {
+            id: Number(result.country.id),
+            iso: String(result.country.iso)
+        };
+
+        if (this.countryCache.size >= 4096) {
+            const oldest = this.countryCache.keys().next().value;
+            if (oldest !== undefined) this.countryCache.delete(oldest);
+        }
+        this.countryCache.set(seek, identity);
+        return identity;
+    }
+
+    private cacheCityResult(
+        seek: number,
+        value: { short?: SxGeo.CityResult; full?: SxGeo.CityFullResult }
+    ): void {
+        if (!this.cityCache.has(seek) && this.cityCache.size >= 4096) {
+            const oldest = this.cityCache.keys().next().value;
+            if (oldest !== undefined) this.cityCache.delete(oldest);
+        }
+        this.cityCache.set(seek, value);
+    }
+
+    private cloneCityResult(result: SxGeo.CityResult): SxGeo.CityResult {
+        return { city: { ...result.city }, country: { ...result.country } };
+    }
+
+    private cloneCityFullResult(result: SxGeo.CityFullResult): SxGeo.CityFullResult {
+        return {
+            city: { ...result.city },
+            region: { ...result.region },
+            country: { ...result.country }
+        };
     }
 
     /**
@@ -608,6 +725,7 @@ class SxGeo {
         const types = ['n/a', 'SxGeo Country', 'SxGeo City RU', 'SxGeo City EN', 'SxGeo City', 'SxGeo City Max RU', 'SxGeo City Max EN', 'SxGeo City Max'];
 
         return {
+            version: this.info.ver,
             created: new Date(this.info.time * 1000).toISOString().split('T')[0].replace(/-/g, '.'),
             timestamp: this.info.time,
             charset: charset[this.info.charset],
@@ -630,6 +748,20 @@ class SxGeo {
                 totalSize: this.info.country_size
             }
         };
+    }
+}
+
+namespace SxGeo {
+    export type FieldValue = number | string;
+    export type RecordData = Record<string, FieldValue>;
+
+    export interface CityResult {
+        city: RecordData;
+        country: RecordData;
+    }
+
+    export interface CityFullResult extends CityResult {
+        region: RecordData;
     }
 }
 
